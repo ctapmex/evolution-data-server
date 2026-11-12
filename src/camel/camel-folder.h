@@ -248,9 +248,14 @@ struct _CamelFolderClass {
 						 GPtrArray **out_uids, /* gchar * */
 						 GCancellable *cancellable,
 						 GError **error);
+	GPtrArray *	(*prepare_remote_body_search_sync)
+						(CamelFolder *folder,
+						 /* const */ GPtrArray *words, /* gchar * */
+						 GCancellable *cancellable,
+						 GError **error);
 
 	/* Padding for future expansion */
-	gpointer reserved_methods[16];
+	gpointer reserved_methods[15];
 
 	/* Signals */
 	void		(*changed)		(CamelFolder *folder,
@@ -519,6 +524,11 @@ gboolean	camel_folder_search_header_sync	(CamelFolder *folder,
 gboolean	camel_folder_search_body_sync	(CamelFolder *folder,
 						 /* const */ GPtrArray *words, /* gchar * */
 						 GPtrArray **out_uids, /* gchar * */
+						 GCancellable *cancellable,
+						 GError **error);
+GPtrArray *	camel_folder_prepare_remote_body_search_sync
+						(CamelFolder *folder,
+						 /* const */ GPtrArray *words, /* gchar * */
 						 GCancellable *cancellable,
 						 GError **error);
 void		camel_folder_take_state_filename (CamelFolder *self,

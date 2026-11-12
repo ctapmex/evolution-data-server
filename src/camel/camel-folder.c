@@ -4890,6 +4890,49 @@ camel_folder_search_body_sync (CamelFolder *folder,
 }
 
 /**
+ * camel_folder_prepare_remote_body_search_sync:
+ * @folder: a #CamelFolder
+ * @words: (element-type utf8): words to search for in the message body
+ * @cancellable: optional #GCancellable object, or %NULL
+ * @error: return location for a #GError, or %NULL
+ *
+ * Asks the @folder to search message bodies on the server for @words and to
+ * make every hit visible to a following local search. Hits that are not in
+ * the local summary yet are added there. The returned UID list is the full
+ * server result: a later local search can trust it and does not need to
+ * download each message to confirm the body.
+ *
+ * Free the returned array with g_ptr_array_unref(), when no longer needed.
+ *
+ * This is optional. When the provider does not implement it, the function
+ * returns %NULL and does not set @error.
+ *
+ * Returns: (element-type utf8) (transfer container) (nullable): matching
+ * message UIDs, or %NULL when the provider cannot search or the call failed
+ *
+ * Since: 3.62
+ **/
+GPtrArray *
+camel_folder_prepare_remote_body_search_sync (CamelFolder *folder,
+					      /* const */ GPtrArray *words, /* gchar * */
+					      GCancellable *cancellable,
+					      GError **error)
+{
+	CamelFolderClass *klass;
+
+	g_return_val_if_fail (CAMEL_IS_FOLDER (folder), NULL);
+	g_return_val_if_fail (words != NULL, NULL);
+
+	klass = CAMEL_FOLDER_GET_CLASS (folder);
+	g_return_val_if_fail (klass != NULL, NULL);
+
+	if (klass->prepare_remote_body_search_sync == NULL)
+		return NULL;
+
+	return klass->prepare_remote_body_search_sync (folder, words, cancellable, error);
+}
+
+/**
  * camel_folder_take_state_filename:
  * @self: a #CamelFolder
  * @filename: (transfer full): the state filename
