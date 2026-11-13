@@ -752,6 +752,7 @@ G_DEFINE_TYPE (SearchCache, search_cache, G_TYPE_OBJECT)
 typedef struct _SearchCacheData {
 	GHashTable *matches; /* SearchCacheKey ~> 0 */
 	GHashTable *failures; /* guint32 folder_id ~> 0; folder ID-s which failed to get the result */
+	GHashTable *authoritative; /* guint32 folder_id ~> 0; server list is final, do not download the body */
 } SearchCacheData;
 
 static SearchCacheData *
@@ -773,6 +774,7 @@ search_cache_data_free (gpointer ptr)
 	if (self) {
 		g_clear_pointer (&self->matches, g_hash_table_unref);
 		g_clear_pointer (&self->failures, g_hash_table_unref);
+		g_clear_pointer (&self->authoritative, g_hash_table_unref);
 		g_free (self);
 	}
 }
@@ -931,6 +933,43 @@ search_cache_get_token_result_matches (SearchCache *self,
 	return search_cache_data_has_match (data, folder_id, uid);
 }
 
+static void
+search_cache_set_token_authoritative (SearchCache *self,
+				      const gchar *token,
+				      guint32 folder_id)
+{
+	SearchCacheData *data;
+
+	if (!self || !token || !folder_id)
+		return;
+
+	data = g_hash_table_lookup (self->cache, token);
+	if (!data)
+		return;
+
+	if (!data->authoritative)
+		data->authoritative = g_hash_table_new (g_direct_hash, g_direct_equal);
+
+	g_hash_table_add (data->authoritative, GUINT_TO_POINTER (folder_id));
+}
+
+static gboolean
+search_cache_get_token_result_authoritative (SearchCache *self,
+					     const gchar *token,
+					     guint32 folder_id)
+{
+	SearchCacheData *data;
+
+	if (!self || !token || !folder_id)
+		return FALSE;
+
+	data = g_hash_table_lookup (self->cache, token);
+	if (!data || !data->authoritative)
+		return FALSE;
+
+	return g_hash_table_contains (data->authoritative, GUINT_TO_POINTER (folder_id));
+}
+
 static GPtrArray * /* gchar * */
 store_search_decode_words (const gchar *encoded_words)
 {
@@ -970,6 +1009,7 @@ struct _CamelStoreSearchPrivate {
 	CamelFolderThreadFlags match_threads_flags;
 
 	gchar *where_clause_sql;
+	GPtrArray *remote_body_searches; /* RemoteBodySearch * */
 
 	/* data related to an ongoing search */
 	struct _ongoing_search {
@@ -1585,6 +1625,61 @@ store_search_compare_date_cb (CamelSExp *sexp,
 	return res;
 }
 
+typedef struct _RemoteBodySearch {
+	gchar *encoded; /* needle passed to camelsearchbody(), uri-escaped words */
+	GPtrArray *words; /* gchar * */
+} RemoteBodySearch;
+
+static void
+remote_body_search_free (gpointer ptr)
+{
+	RemoteBodySearch *search = ptr;
+
+	if (!search)
+		return;
+
+	g_free (search->encoded);
+	g_clear_pointer (&search->words, g_ptr_array_unref);
+	g_free (search);
+}
+
+static void
+camel_store_search_clear_remote_body_searches (CamelStoreSearch *self)
+{
+	g_clear_pointer (&self->priv->remote_body_searches, g_ptr_array_unref);
+}
+
+static void
+camel_store_search_remember_body_words (CamelStoreSearch *self,
+					const gchar *encoded,
+					GPtrArray *words)
+{
+	RemoteBodySearch *search;
+	guint ii;
+
+	if (!self || !encoded || !*encoded || !words || !words->len)
+		return;
+
+	if (!self->priv->remote_body_searches)
+		self->priv->remote_body_searches = g_ptr_array_new_with_free_func (remote_body_search_free);
+
+	for (ii = 0; ii < self->priv->remote_body_searches->len; ii++) {
+		RemoteBodySearch *existing = g_ptr_array_index (self->priv->remote_body_searches, ii);
+
+		if (g_strcmp0 (existing->encoded, encoded) == 0)
+			return;
+	}
+
+	search = g_new0 (RemoteBodySearch, 1);
+	search->encoded = g_strdup (encoded);
+	search->words = g_ptr_array_new_full (words->len, g_free);
+
+	for (ii = 0; ii < words->len; ii++)
+		g_ptr_array_add (search->words, g_strdup (g_ptr_array_index (words, ii)));
+
+	g_ptr_array_add (self->priv->remote_body_searches, search);
+}
+
 static CamelSExpResult *
 store_search_body_contains (CamelSExp *sexp,
 			    gint argc,
@@ -1594,6 +1689,8 @@ store_search_body_contains (CamelSExp *sexp,
 {
 	CamelSExpResult *res = store_search_create_string_result (sexp);
 	GString *stmt = NULL;
+	GString *encoded = NULL;
+	GPtrArray *words = NULL;
 	ResultFlags max_flags = 0;
 	gint ii;
 
@@ -1603,22 +1700,27 @@ store_search_body_contains (CamelSExp *sexp,
 		if (res1->type == CAMEL_SEXP_RES_STRING && res1->value.string && *res1->value.string) {
 			gchar *escaped;
 
+			escaped = g_uri_escape_string (res1->value.string, NULL, FALSE);
+			if (!escaped)
+				continue;
+
 			if (!stmt) {
 				stmt = g_string_new ("camelsearchbody(");
 				g_string_append_printf (stmt, "'%p',uid,%d,'", self, (gint) cmp_kind);
+				encoded = g_string_new ("");
+				words = g_ptr_array_new_with_free_func (g_free);
 			} else {
 				g_string_append_c (stmt, ' ');
+				g_string_append_c (encoded, ' ');
 			}
 
 			max_flags |= store_search_result_get_flags (res1);
 
-			escaped = g_uri_escape_string (res1->value.string, NULL, FALSE);
+			g_string_append (stmt, escaped);
+			g_string_append (encoded, escaped);
+			g_ptr_array_add (words, g_strdup (res1->value.string));
 
-			if (escaped) {
-				g_string_append (stmt, escaped);
-
-				g_free (escaped);
-			}
+			g_free (escaped);
 		}
 	}
 
@@ -1626,7 +1728,14 @@ store_search_body_contains (CamelSExp *sexp,
 		g_string_append (stmt, "')");
 		store_search_result_add_flags (res, RESULT_NEEDS_MSG_BODY | max_flags);
 		res->value.string = g_string_free (stmt, FALSE);
+
+		if (cmp_kind == CMP_BODY_TEXT)
+			camel_store_search_remember_body_words (self, encoded->str, words);
 	}
+
+	if (encoded)
+		g_string_free (encoded, TRUE);
+	g_clear_pointer (&words, g_ptr_array_unref);
 
 	return res;
 }
@@ -2358,6 +2467,7 @@ camel_store_search_finalize (GObject *object)
 	g_clear_pointer (&self->priv->where_clause_sql, g_free);
 	g_clear_pointer (&self->priv->result_index, camel_store_search_index_unref);
 	g_clear_pointer (&self->priv->match_indexes, g_hash_table_unref);
+	camel_store_search_clear_remote_body_searches (self);
 
 	G_OBJECT_CLASS (camel_store_search_parent_class)->finalize (object);
 }
@@ -2855,6 +2965,64 @@ camel_store_search_populate_result_index_cb (gpointer user_data,
 	return TRUE;
 }
 
+/* Asks the folder to search bodies on the server before the local SELECT, so
+ * hits that are not in the summary yet are inserted first. A successful list
+ * is authoritative: camel_store_search_search_body_run_sync() will not
+ * download those messages to confirm the body. Failure leaves the previous
+ * local-body fallback in place. Cancellation aborts the whole search. */
+static gboolean
+camel_store_search_prepare_remote_body_matches (CamelStoreSearch *self,
+						GError **error)
+{
+	CamelFolder *folder;
+	CamelFolderClass *klass;
+	guint ii;
+
+	folder = self->priv->ongoing_search.folder;
+	if (!folder || !self->priv->remote_body_searches || !self->priv->remote_body_searches->len)
+		return TRUE;
+
+	klass = CAMEL_FOLDER_GET_CLASS (folder);
+	if (!klass || !klass->prepare_remote_body_search_sync)
+		return TRUE;
+
+	for (ii = 0; ii < self->priv->remote_body_searches->len; ii++) {
+		RemoteBodySearch *search = g_ptr_array_index (self->priv->remote_body_searches, ii);
+		GPtrArray *uids = NULL;
+		GError *local_error = NULL;
+
+		if (g_cancellable_set_error_if_cancelled (self->priv->ongoing_search.cancellable, error)) {
+			self->priv->ongoing_search.success = FALSE;
+			return FALSE;
+		}
+
+		uids = klass->prepare_remote_body_search_sync (folder, search->words,
+			self->priv->ongoing_search.cancellable, &local_error);
+
+		if (g_error_matches (local_error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
+			g_propagate_error (error, local_error);
+			g_clear_pointer (&uids, g_ptr_array_unref);
+			self->priv->ongoing_search.success = FALSE;
+			return FALSE;
+		}
+
+		if (uids && self->priv->ongoing_search.search_body) {
+			search_cache_add_token_result (self->priv->ongoing_search.search_body,
+				search->encoded, self->priv->ongoing_search.folder_id, uids, FALSE);
+			search_cache_set_token_authoritative (self->priv->ongoing_search.search_body,
+				search->encoded, self->priv->ongoing_search.folder_id);
+		} else if (local_error && camel_debug ("search")) {
+			printf ("[camel-search] Remote body search in '%s' failed: %s\n",
+				camel_folder_get_full_name (folder), local_error->message);
+		}
+
+		g_clear_error (&local_error);
+		g_clear_pointer (&uids, g_ptr_array_unref);
+	}
+
+	return TRUE;
+}
+
 static gboolean
 camel_store_search_populate_result_index_sync (CamelStoreSearch *self,
 					       GCancellable *cancellable,
@@ -2888,6 +3056,11 @@ camel_store_search_populate_result_index_sync (CamelStoreSearch *self,
 		self->priv->ongoing_search.error = error;
 		self->priv->ongoing_search.folder_id = folder_id;
 		self->priv->ongoing_search.folder = folder;
+
+		if (!camel_store_search_prepare_remote_body_matches (self, error)) {
+			success = FALSE;
+			break;
+		}
 
 		rid.result_index = NULL;
 		rid.store = self->priv->store;
@@ -2957,6 +3130,7 @@ camel_store_search_rebuild_sync (CamelStoreSearch *self,
 	self->priv->match_threads_kind = CAMEL_MATCH_THREADS_KIND_NONE;
 	self->priv->needs_rebuild = FALSE;
 
+	camel_store_search_clear_remote_body_searches (self);
 	camel_store_search_clear_ongoing_search_data (self);
 
 	if (!self->priv->expression)
@@ -3190,6 +3364,11 @@ camel_store_search_get_items_sync (CamelStoreSearch *self,
 		self->priv->ongoing_search.folder_id = folder_id;
 		self->priv->ongoing_search.folder = folder;
 
+		if (!camel_store_search_prepare_remote_body_matches (self, error)) {
+			success = FALSE;
+			break;
+		}
+
 		do {
 			g_clear_pointer (&items, g_ptr_array_unref);
 			items = g_ptr_array_new_full (1024, camel_store_search_item_free);
@@ -3324,25 +3503,29 @@ camel_store_search_get_uids_sync (CamelStoreSearch *self,
 		self->priv->ongoing_search.folder_id = folder_id;
 		self->priv->ongoing_search.folder = folder;
 
-		do {
-			g_clear_pointer (&uids, g_ptr_array_unref);
-			uids = g_ptr_array_new_full (128, (GDestroyNotify) camel_pstring_free);
+		if (!camel_store_search_prepare_remote_body_matches (self, error)) {
+			success = FALSE;
+		} else {
+			do {
+				g_clear_pointer (&uids, g_ptr_array_unref);
+				uids = g_ptr_array_new_full (128, (GDestroyNotify) camel_pstring_free);
 
-			if (!camel_store_search_prepare_folder_data (self, error)) {
-				success = FALSE;
-				break;
-			}
+				if (!camel_store_search_prepare_folder_data (self, error)) {
+					success = FALSE;
+					break;
+				}
 
-			g_warn_if_fail (self->priv->ongoing_search.in_select == 0);
-			self->priv->ongoing_search.in_select++;
-			success = camel_db_exec_select (cdb, stmt->str, camel_store_search_read_uids_cb, uids, error);
-			self->priv->ongoing_search.in_select--;
+				g_warn_if_fail (self->priv->ongoing_search.in_select == 0);
+				self->priv->ongoing_search.in_select++;
+				success = camel_db_exec_select (cdb, stmt->str, camel_store_search_read_uids_cb, uids, error);
+				self->priv->ongoing_search.in_select--;
 
-			if (!success || !self->priv->ongoing_search.success)
-				break;
-		} while (camel_store_search_handle_remote_ops_sync (self, &success, cancellable, error));
+				if (!success || !self->priv->ongoing_search.success)
+					break;
+			} while (camel_store_search_handle_remote_ops_sync (self, &success, cancellable, error));
 
-		g_ptr_array_extend_and_steal (*out_uids, g_steal_pointer (&uids));
+			g_ptr_array_extend_and_steal (*out_uids, g_steal_pointer (&uids));
+		}
 
 		g_string_free (stmt, TRUE);
 
@@ -3847,9 +4030,15 @@ camel_store_search_search_body_run_sync (CamelStoreSearch *self,
 			}
 		}
 
-		if (!search_cache_get_token_result_failed (cache, op->needle, folder_id) &&
-		    !search_cache_get_token_result_matches (cache, op->needle, folder_id, uid)) {
-			return TRUE;
+		if (!search_cache_get_token_result_failed (cache, op->needle, folder_id)) {
+			if (search_cache_get_token_result_authoritative (cache, op->needle, folder_id) &&
+			    search_cache_get_token_result_matches (cache, op->needle, folder_id, uid)) {
+				*out_matches = TRUE;
+				return TRUE;
+			}
+
+			if (!search_cache_get_token_result_matches (cache, op->needle, folder_id, uid))
+				return TRUE;
 		}
 
 		if (g_cancellable_set_error_if_cancelled (self->priv->ongoing_search.cancellable, self->priv->ongoing_search.error)) {
